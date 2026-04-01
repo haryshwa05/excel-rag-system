@@ -1,0 +1,23 @@
+# ── Core framework ─────────────────────────────────────────────────
+fastapi>=0.109.0          # The web framework
+uvicorn[standard]>=0.27.0 # ASGI server that runs FastAPI
+python-multipart>=0.0.6   # Required for file uploads in FastAPI
+
+# ── Configuration ──────────────────────────────────────────────────
+pydantic>=2.5.0           # Data validation (used by FastAPI too)
+pydantic-settings>=2.1.0  # BaseSettings for .env file loading
+
+# ── Data processing ────────────────────────────────────────────────
+pandas>=2.1.0             # Excel/CSV reading with chunked support
+openpyxl>=3.1.0           # Engine for reading .xlsx files (pandas needs this)
+
+# ── Vector database ────────────────────────────────────────────────
+chromadb>=0.4.22          # Vector database for storing/searching embeddings
+
+# ── LLM & Embedding providers ─────────────────────────────────────
+openai>=1.10.0            # OpenAI API client (embeddings + GPT)
+anthropic>=0.18.0         # Anthropic API client (Claude)
+
+# ── Optional: HuggingFace local embeddings ─────────────────────────
+# Included by default since huggingface is the default embedding provider (free!)
+sentence-transformers>=2.3.0
