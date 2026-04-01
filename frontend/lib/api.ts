@@ -1,46 +1,41 @@
-/**
- * API Client — all communication with the FastAPI backend.
- *
- * WHAT THIS FILE DOES:
- * Provides typed functions for every backend endpoint.
- * Handles SSE stream reading for upload progress and chat streaming.
- *
- * WHY A SEPARATE FILE:
- * Components shouldn't know about HTTP details (URLs, headers, parsing).
- * They call api.uploadFile() or api.queryStream() and get clean data back.
- * If the backend URL changes, you update ONE file.
- *
- * SSE READING PATTERN:
- * fetch() returns a Response with a ReadableStream body.
- * We read chunks from the stream, decode them to text, parse SSE events,
- * and call the provided callback for each event.
- */
+// Direct backend URL avoids Next dev-server proxy stalls for large streaming uploads.
+// Override via NEXT_PUBLIC_API_BASE if needed.
+const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000/api";
 
-// ── Types ─────────────────────────────────────────────────────────
+/* ── Types ─────────────────────────────────────────────────────── */
 
-export interface UploadProgress {
-  stage: string;
-  percent: number;
-  message: string;
-  file_id?: string;
+export interface FileInfo {
+  file_id: string;
+  file_name: string;
+  chunks?: number;
+  total_chunks?: number;
+  total_rows?: number;
+  sheets?: string[];
 }
 
 export interface UploadResult {
   file_id: string;
   file_name: string;
   total_chunks: number;
-  total_rows_processed: number;
-  sheets: string[];
   status: string;
 }
 
-export interface FileInfo {
-  file_id: string;
-  file_name: string;
-  chunks: number;
+export interface UploadProgressEvent {
+  stage: string;
+  percent?: number;
+  message?: string;
+  file_id?: string;
+  error?: string;
 }
 
-export interface QuerySource {
+export interface QueryRequest {
+  question: string;
+  file_id?: string;
+  sheet_name?: string;
+  chat_history?: Array<{ role: string; content: string }>;
+}
+
+export interface Source {
   file_name: string;
   sheet_name: string;
   row_start: number;
@@ -48,208 +43,213 @@ export interface QuerySource {
   score: number;
 }
 
-export interface QueryFullResponse {
-  answer: string;
-  sources: QuerySource[];
-  chunks_searched: number;
+export interface QueryStreamCallbacks {
+  onToken: (token: string) => void;
+  onSources?: (sources: Source[]) => void;
+  onDone: () => void;
+  onError: (err: string) => void;
 }
 
-// ── Base URL ──────────────────────────────────────────────────────
+/* ── File management ───────────────────────────────────────────── */
 
-// In development, Next.js rewrites /api/* to localhost:8000/api/*
-// In production, the backend would be on the same domain or a configured URL
-const API_BASE = "/api";
+export async function getFiles(): Promise<FileInfo[]> {
+  try {
+    const res = await fetch(`${BASE}/files`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.files ?? []).map((f: FileInfo) => ({
+      ...f,
+      chunks: f.total_chunks ?? f.chunks ?? 0,
+    }));
+  } catch {
+    return [];
+  }
+}
 
-// ── File Upload with SSE Progress ─────────────────────────────────
+export async function deleteFile(fileId: string): Promise<void> {
+  const res = await fetch(`${BASE}/files/${fileId}`, { method: "DELETE" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? "Delete failed.");
+  }
+}
+
+/* ── File upload with SSE progress ─────────────────────────────── */
 
 export async function uploadFile(
   file: File,
-  onProgress: (progress: UploadProgress) => void,
-): Promise<UploadResult | null> {
-  /**
-   * Upload a file and receive progress updates via SSE.
-   *
-   * HOW IT WORKS:
-   * 1. Send the file as multipart form data
-   * 2. The backend keeps the connection open and streams SSE events
-   * 3. We read each event and call onProgress()
-   * 4. When the stream ends, we return the final result
-   *
-   * WHY FormData:
-   * Files can't be sent as JSON. FormData is the browser's way of
-   * sending files over HTTP — it encodes the file as multipart/form-data,
-   * which FastAPI's UploadFile parameter knows how to receive.
-   */
-  const formData = new FormData();
-  formData.append("file", file);
+  onProgress: (e: UploadProgressEvent) => void
+): Promise<UploadResult> {
+  const form = new FormData();
+  form.append("file", file);
 
-  const response = await fetch(`${API_BASE}/upload`, {
-    method: "POST",
-    body: formData,
-    // Note: do NOT set Content-Type header — the browser sets it
-    // automatically with the correct multipart boundary string.
-    // Setting it manually breaks the upload.
-  });
+  const res = await fetch(`${BASE}/upload`, { method: "POST", body: form });
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: "Upload failed" }));
-    throw new Error(error.detail || "Upload failed");
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail ?? `Upload failed (${res.status})`);
   }
 
-  // Read the SSE stream
-  return await readSSEStream<UploadResult>(response, (event) => {
-    if (event.stage && event.percent !== undefined) {
-      onProgress(event as UploadProgress);
-    }
-    // The final event contains the result (has file_id + total_chunks)
-    if (event.file_id && event.total_chunks !== undefined) {
-      return event as UploadResult;
-    }
-    return null;
-  });
+  return readSSEStream<UploadResult>(res, onProgress);
 }
 
-// ── Streaming Query ───────────────────────────────────────────────
+/* ── Query streaming ───────────────────────────────────────────── */
 
-export async function queryStream(
-  question: string,
-  fileId: string | null,
-  sheetName: string | null,
-  chatHistory: { role: string; content: string }[],
-  onToken: (token: string) => void,
-): Promise<void> {
-  /**
-   * Send a question and receive the answer token by token via SSE.
-   *
-   * HOW THE FRONTEND USES THIS:
-   * 1. User types a question and hits send
-   * 2. This function streams tokens to the onToken callback
-   * 3. The ChatBox component appends each token to the message bubble
-   * 4. The user sees the answer "typing itself out"
-   *
-   * The chat history is sent so the LLM understands references like
-   * "break that down by region" (what does "that" refer to?).
-   */
-  const response = await fetch(`${API_BASE}/query`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      question,
-      file_id: fileId,
-      sheet_name: sheetName,
-      chat_history: chatHistory,
-    }),
-  });
+export function queryStream(
+  body: QueryRequest,
+  callbacks: QueryStreamCallbacks
+): { abort: () => void } {
+  const controller = new AbortController();
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: "Query failed" }));
-    throw new Error(error.detail || "Query failed");
-  }
+  (async () => {
+    try {
+      const res = await fetch(`${BASE}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
 
-  // Read the SSE stream token by token
-  await readSSEStream(response, (event) => {
-    if (event.error) {
-      throw new Error(event.error);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        callbacks.onError(data.detail ?? `Request failed (${res.status})`);
+        return;
+      }
+
+      await readSSETokenStream(res, callbacks);
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === "AbortError") return;
+      callbacks.onError(e instanceof Error ? e.message : "Network error.");
     }
-    if (event.token != null && event.token !== "") {
-      onToken(event.token);
-    }
-    return null;
-  });
+  })();
+
+  return { abort: () => controller.abort() };
 }
 
-// ── File Management ───────────────────────────────────────────────
+/* ── SSE helpers ───────────────────────────────────────────────── */
 
-export async function getFiles(): Promise<FileInfo[]> {
-  const response = await fetch(`${API_BASE}/files`);
-  if (!response.ok) return [];
-  const data = await response.json();
-  return data.files || [];
-}
-
-export async function deleteFile(fileId: string): Promise<boolean> {
-  const response = await fetch(`${API_BASE}/files/${fileId}`, {
-    method: "DELETE",
-  });
-  if (!response.ok) return false;
-  const data = await response.json();
-  return data.deleted;
-}
-
-// ── SSE Stream Reader ─────────────────────────────────────────────
-
+/**
+ * Reads an SSE stream that terminates with a final JSON payload.
+ * Used by /upload — progress events are forwarded to `onProgress`, the
+ * last event (no `stage`) is returned as the final result.
+ */
 async function readSSEStream<T>(
-  response: Response,
-  onEvent: (data: any) => T | null,
-): Promise<T | null> {
-  /**
-   * Generic SSE stream reader.
-   *
-   * HOW SSE PARSING WORKS:
-   * The server sends text like:
-   *     data: {"token": "The"}\n\n
-   *     data: {"token": " top"}\n\n
-   *     data: {"done": true}\n\n
-   *
-   * We read raw bytes from the stream, decode to text, split by
-   * double newlines (event boundaries), extract the JSON after "data: ",
-   * and call the onEvent callback with each parsed object.
-   *
-   * WHY MANUAL PARSING (not EventSource):
-   * The browser's EventSource API only works with GET requests.
-   * Our endpoints use POST (to send the question in the body).
-   * So we use fetch() + ReadableStream and parse SSE manually.
-   * This is the standard approach — ChatGPT's frontend does the same thing.
-   *
-   * THE BUFFER PATTERN:
-   * Network chunks don't align with SSE events. One chunk might contain
-   * half an event, or two complete events. We buffer incoming text and
-   * process complete events (delimited by \n\n) as they arrive.
-   */
-  const reader = response.body?.getReader();
-  if (!reader) return null;
-
+  res: Response,
+  onProgress: (e: UploadProgressEvent) => void
+): Promise<T> {
+  const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let result: T | null = null;
+  let lastResult: T | null = null;
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  // Prevent indefinite spinner if the stream stalls with no events.
+  const readWithTimeout = async () => {
+    return await Promise.race([
+      reader.read(),
+      new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) =>
+        setTimeout(() => reject(new Error("Upload stream timed out. Please retry.")), 120000)
+      ),
+    ]);
+  };
 
-      // Decode the raw bytes to text and add to buffer
-      buffer += decoder.decode(value, { stream: true });
+  while (true) {
+    const { value, done } = await readWithTimeout();
+    if (done) break;
 
-      // Process complete events (each ends with \n\n)
-      const events = buffer.split("\n\n");
-      // The last element might be incomplete — keep it in the buffer
-      buffer = events.pop() || "";
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
 
-      for (const event of events) {
-        const dataLine = event
-          .split("\n")
-          .find((line) => line.startsWith("data: "));
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const raw = line.slice(6).trim();
+      if (!raw) continue;
 
-        if (!dataLine) continue;
+      let evt: Record<string, unknown>;
+      try {
+        evt = JSON.parse(raw);
+      } catch {
+        continue;
+      }
 
-        const jsonStr = dataLine.slice(6);
-        let data: any;
-        try {
-          data = JSON.parse(jsonStr);
-        } catch {
-          continue; // skip malformed JSON only
-        }
-        // Call onEvent outside the try/catch so its errors propagate
-        const eventResult = onEvent(data);
-        if (eventResult !== null) {
-          result = eventResult;
-        }
+      // A progress event has a `stage` field; the final result has `file_id`
+      if (evt.stage) {
+        onProgress(evt as unknown as UploadProgressEvent);
+      } else if (evt.file_id) {
+        lastResult = evt as unknown as T;
+      } else if (evt.error) {
+        onProgress({ stage: "error", message: String(evt.error) });
+        throw new Error(String(evt.error));
       }
     }
-  } finally {
-    reader.releaseLock();
   }
 
-  return result;
+  if (!lastResult) throw new Error("No result returned from upload.");
+  return lastResult;
+}
+
+/**
+ * Reads an SSE token stream. Each event is either:
+ *   { token: "..." }        — partial LLM output
+ *   { sources: [...] }      — retrieval metadata
+ *   { done: true }          — stream finished
+ *   { error: "...", done: true } — stream error
+ */
+async function readSSETokenStream(
+  res: Response,
+  callbacks: QueryStreamCallbacks
+): Promise<void> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const readWithTimeout = async () => {
+    return await Promise.race([
+      reader.read(),
+      new Promise<ReadableStreamReadResult<Uint8Array>>((_, reject) =>
+        setTimeout(() => reject(new Error("Response stream timed out. Please retry.")), 120000)
+      ),
+    ]);
+  };
+
+  while (true) {
+    const { value, done } = await readWithTimeout();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const raw = line.slice(6).trim();
+      if (!raw) continue;
+
+      let evt: Record<string, unknown>;
+      try {
+        evt = JSON.parse(raw);
+      } catch {
+        // Malformed JSON — skip silently
+        continue;
+      }
+
+      if (evt.error != null) {
+        callbacks.onError(String(evt.error));
+        return;
+      }
+
+      if (evt.done) {
+        callbacks.onDone();
+        return;
+      }
+
+      if (typeof evt.token === "string" && evt.token !== "") {
+        callbacks.onToken(evt.token);
+      }
+
+      if (Array.isArray(evt.sources)) {
+        callbacks.onSources?.(evt.sources as Source[]);
+      }
+    }
+  }
 }

@@ -1,215 +1,228 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-import {
-  Upload, FileSpreadsheet, CheckCircle, AlertCircle,
-  X, ScanLine, Cpu, Database, Sparkles,
-} from "lucide-react";
-import { uploadFile, UploadProgress, UploadResult } from "@/lib/api";
+import { Upload, FileSpreadsheet, FileText, CheckCircle, AlertCircle, Loader2, X } from "lucide-react";
+import { uploadFile, UploadProgressEvent, UploadResult } from "@/lib/api";
 
-interface FileUploaderProps {
+interface Props {
   onUploadComplete: (result: UploadResult) => void;
 }
 
-const STAGES: { key: string; label: string; icon: React.ReactNode; detail: string }[] = [
-  {
-    key: "parsing",
-    label: "Reading",
-    icon: <ScanLine size={14} />,
-    detail: "Extracting rows and sheets from your spreadsheet",
-  },
-  {
-    key: "embedding",
-    label: "Embedding",
-    icon: <Cpu size={14} />,
-    detail: "Converting data into searchable vectors",
-  },
-  {
-    key: "storing",
-    label: "Storing",
-    icon: <Database size={14} />,
-    detail: "Saving vectors to the database",
-  },
-  {
-    key: "complete",
-    label: "Ready",
-    icon: <Sparkles size={14} />,
-    detail: "Your file is ready to query",
-  },
-];
+type Stage = "idle" | "uploading" | "parsing" | "embedding" | "indexing" | "done" | "error";
 
-function stageIndex(stage: string) {
-  return STAGES.findIndex((s) => s.key === stage);
+interface Progress {
+  stage: Stage;
+  percent: number;
+  message: string;
 }
 
-export default function FileUploader({ onUploadComplete }: FileUploaderProps) {
-  const [isDragging, setIsDragging]   = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const [progress, setProgress]       = useState<UploadProgress | null>(null);
-  const [error, setError]             = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+const STAGE_LABELS: Record<Stage, string> = {
+  idle:      "Ready",
+  uploading: "Uploading…",
+  parsing:   "Parsing file…",
+  embedding: "Generating embeddings…",
+  indexing:  "Building search index…",
+  done:      "Complete",
+  error:     "Error",
+};
 
-  const handleFile = useCallback(
-    async (file: File) => {
-      const ext = file.name.split(".").pop()?.toLowerCase();
-      if (!ext || !["csv", "xlsx", "xls"].includes(ext)) {
-        setError("Please upload a .csv, .xlsx, or .xls file");
-        return;
-      }
-      if (file.size > 100 * 1024 * 1024) {
-        setError("File too large. Maximum size is 100 MB.");
-        return;
-      }
+const ALLOWED = [".csv", ".xlsx", ".xls", ".pdf"];
+const MAX_MB  = 100;
 
-      setError(null);
-      setIsUploading(true);
-      setProgress(null);
+export default function FileUploader({ onUploadComplete }: Props) {
+  const [dragging,  setDragging]  = useState(false);
+  const [file,      setFile]      = useState<File | null>(null);
+  const [progress,  setProgress]  = useState<Progress | null>(null);
+  const [result,    setResult]    = useState<UploadResult | null>(null);
+  const [error,     setError]     = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-      try {
-        const result = await uploadFile(file, (p) => setProgress(p));
-        setIsUploading(false);
-        if (result) onUploadComplete(result);
-      } catch (err: any) {
-        setError(err.message || "Upload failed");
-      } finally {
-        setIsUploading(false);
-      }
-    },
-    [onUploadComplete],
-  );
+  const reset = () => { setFile(null); setProgress(null); setResult(null); setError(null); };
 
-  const handleDragOver  = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(true);  }, []);
-  const handleDragLeave = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(false); }, []);
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const validateFile = (f: File): string | null => {
+    const ext = "." + (f.name.split(".").pop()?.toLowerCase() ?? "");
+    if (!ALLOWED.includes(ext)) return `Unsupported type "${ext}". Allowed: ${ALLOWED.join(", ")}`;
+    if (f.size > MAX_MB * 1024 * 1024) return `File too large (${(f.size / 1024 / 1024).toFixed(1)} MB). Max: ${MAX_MB} MB.`;
+    return null;
+  };
+
+  const handleFile = useCallback(async (f: File) => {
+    const err = validateFile(f);
+    if (err) { setError(err); return; }
+
+    setFile(f);
+    setError(null);
+    setResult(null);
+    setProgress({ stage: "uploading", percent: 2, message: "Uploading…" });
+
+    try {
+      const res = await uploadFile(f, (evt: UploadProgressEvent) => {
+        if (evt.stage === "error") {
+          setProgress({ stage: "error", percent: 0, message: evt.message ?? "Unknown error" });
+          setError(evt.message ?? "Unknown error");
+          return;
+        }
+        const stageMap: Record<string, Stage> = {
+          parsing: "parsing", embedding: "embedding",
+          storing: "embedding", indexing: "indexing", complete: "done",
+        };
+        const mapped = stageMap[evt.stage] ?? "uploading";
+        setProgress({ stage: mapped, percent: evt.percent ?? 0, message: evt.message ?? "" });
+      });
+
+      setProgress({ stage: "done", percent: 100, message: "Indexed and ready." });
+      setResult(res);
+      onUploadComplete(res);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Upload failed.";
+      setProgress({ stage: "error", percent: 0, message: msg });
+      setError(msg);
+    }
+  }, [onUploadComplete]);
+
+  const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) handleFile(file);
+    setDragging(false);
+    const f = e.dataTransfer.files?.[0];
+    if (f) handleFile(f);
   }, [handleFile]);
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) handleFile(file);
+  const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (f) handleFile(f);
     e.target.value = "";
   };
 
-  const currentStageIdx = progress ? stageIndex(progress.stage) : -1;
+  const ext = file?.name.split(".").pop()?.toLowerCase();
+  const FileIcon = ext === "pdf" ? FileText : FileSpreadsheet;
+  const iconColor =
+    ext === "pdf" ? "var(--color-pdf)" :
+    ext === "csv" ? "var(--color-csv)" : "var(--color-excel)";
 
-  return (
-    <div className="w-full space-y-3">
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".csv,.xlsx,.xls"
-        onChange={handleInputChange}
-        className="hidden"
-      />
-
-      {/* Drop zone */}
+  /* ── Done state ────────────────────────────────────────────────── */
+  if (result && progress?.stage === "done") {
+    return (
       <div
-        onClick={!isUploading ? () => fileInputRef.current?.click() : undefined}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-        className={[
-          "relative rounded-2xl border-2 border-dashed transition-all duration-200 overflow-hidden",
-          isUploading ? "cursor-default" : "cursor-pointer",
-          isDragging
-            ? "border-accent bg-accent-soft scale-[1.01] shadow-lg"
-            : isUploading
-              ? "border-accent/40 bg-accent-soft/30"
-              : "border-border hover:border-accent/60 hover:bg-surface-1",
-        ].join(" ")}
+        className="rounded-xl p-5 flex items-start gap-3 anim-fade-up"
+        style={{ background: "var(--color-success-dim)", border: "1px solid rgba(16,185,129,0.25)" }}
       >
-        {isUploading ? (
-          <div className="px-6 py-7 space-y-5">
-            {/* File name + spinner */}
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-accent-soft flex items-center justify-center shrink-0">
-                <FileSpreadsheet size={18} className="text-accent" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-semibold text-ink truncate">
-                  {progress?.message || "Processing…"}
-                </p>
-                <p className="text-xs text-ink-faint mt-0.5">
-                  {progress?.percent != null ? `${Math.round(progress.percent)}%` : "Starting…"}
-                </p>
-              </div>
-              <div className="w-6 h-6 rounded-full border-2 border-accent/30 border-t-accent animate-spin-slow shrink-0" />
-            </div>
+        <CheckCircle size={18} style={{ color: "var(--color-success)", flexShrink: 0 }} />
+        <div className="flex-1 min-w-0">
+          <p className="text-[13px] font-semibold" style={{ color: "var(--color-text)" }}>
+            {result.file_name}
+          </p>
+          <p className="text-[12px] mt-0.5" style={{ color: "var(--color-text-2)" }}>
+            {result.total_chunks} chunks indexed · Ready to query
+          </p>
+        </div>
+        <button onClick={reset} className="p-1 rounded hover:bg-white/5">
+          <X size={13} style={{ color: "var(--color-text-3)" }} />
+        </button>
+      </div>
+    );
+  }
 
-            {/* Progress bar */}
-            <div className="h-1.5 w-full bg-surface-3 rounded-full overflow-hidden">
+  /* ── Processing state ──────────────────────────────────────────── */
+  if (file && progress) {
+    const pct     = Math.round(progress.percent);
+    const isError = progress.stage === "error";
+
+    return (
+      <div
+        className="rounded-xl p-5 space-y-4 anim-fade-up"
+        style={{
+          background: isError ? "var(--color-danger-dim)" : "var(--color-raised)",
+          border: `1px solid ${isError ? "rgba(239,68,68,0.25)" : "var(--color-border-mid)"}`,
+        }}
+      >
+        <div className="flex items-center gap-3">
+          <FileIcon size={18} style={{ color: isError ? "var(--color-danger)" : iconColor, flexShrink: 0 }} />
+          <div className="min-w-0 flex-1">
+            <p className="text-[12.5px] font-medium truncate" style={{ color: "var(--color-text)" }}>{file.name}</p>
+            <p className="text-[11px]" style={{ color: "var(--color-text-2)" }}>
+              {(file.size / 1024 / 1024).toFixed(2)} MB
+            </p>
+          </div>
+          {isError ? (
+            <button onClick={reset} className="p-1 rounded hover:bg-white/5">
+              <X size={13} style={{ color: "var(--color-text-3)" }} />
+            </button>
+          ) : (
+            <Loader2 size={14} className="anim-spin" style={{ color: "var(--color-accent)" }} />
+          )}
+        </div>
+
+        {!isError && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11px]" style={{ color: "var(--color-text-2)" }}>
+                {STAGE_LABELS[progress.stage]}
+              </span>
+              <span className="text-[11px] font-medium" style={{ color: "var(--color-accent-text)" }}>
+                {pct}%
+              </span>
+            </div>
+            <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: "var(--color-elevated)" }}>
               <div
-                className="h-full bg-accent rounded-full transition-all duration-700 ease-out"
-                style={{ width: `${progress?.percent ?? 0}%` }}
+                className="h-full rounded-full transition-all duration-500"
+                style={{ width: `${pct}%`, background: "linear-gradient(90deg, #6366f1, #a5b4fc)" }}
               />
             </div>
-
-            {/* Stage steps */}
-            <div className="grid grid-cols-4 gap-1">
-              {STAGES.map((stage, i) => {
-                const done    = i < currentStageIdx;
-                const current = i === currentStageIdx;
-                const future  = i > currentStageIdx;
-                return (
-                  <div key={stage.key} className="flex flex-col items-center gap-1.5 text-center">
-                    <div className={[
-                      "w-8 h-8 rounded-lg flex items-center justify-center transition-all",
-                      done    ? "bg-success text-white"      : "",
-                      current ? "bg-accent text-white animate-pulse-ring" : "",
-                      future  ? "bg-surface-3 text-ink-faint" : "",
-                    ].join(" ")}>
-                      {done ? <CheckCircle size={14} /> : stage.icon}
-                    </div>
-                    <span className={[
-                      "text-[10px] font-medium leading-tight",
-                      done ? "text-success" : current ? "text-accent" : "text-ink-faint",
-                    ].join(" ")}>
-                      {stage.label}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-
-            {currentStageIdx >= 0 && (
-              <p className="text-[11px] text-ink-faint text-center animate-fade-in">
-                {STAGES[currentStageIdx]?.detail}
-              </p>
-            )}
+            <p className="text-[10.5px]" style={{ color: "var(--color-text-3)" }}>{progress.message}</p>
           </div>
-        ) : (
-          <div className="px-8 py-12 flex flex-col items-center gap-4 text-center">
-            <div className={[
-              "w-16 h-16 rounded-2xl flex items-center justify-center transition-all duration-200",
-              isDragging ? "bg-accent text-white scale-110" : "bg-surface-2 text-ink-faint",
-            ].join(" ")}>
-              <Upload size={26} />
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-ink">
-                {isDragging ? "Drop it here!" : (
-                  <>Drop your spreadsheet or{" "}
-                    <span className="text-accent underline underline-offset-2">browse</span>
-                  </>
-                )}
-              </p>
-              <p className="text-xs text-ink-faint mt-1.5">CSV · XLSX · XLS — up to 100 MB</p>
-            </div>
+        )}
+
+        {isError && (
+          <div className="flex items-center gap-2">
+            <AlertCircle size={13} style={{ color: "var(--color-danger)" }} />
+            <p className="text-[12px]" style={{ color: "var(--color-danger)" }}>{progress.message}</p>
           </div>
         )}
       </div>
+    );
+  }
 
-      {/* Error */}
+  /* ── Drop zone ─────────────────────────────────────────────────── */
+  return (
+    <div
+      onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={onDrop}
+      onClick={() => inputRef.current?.click()}
+      className="relative cursor-pointer rounded-xl p-6 flex flex-col items-center gap-3 transition-all select-none"
+      style={{
+        background: dragging ? "var(--color-accent-dim)" : "var(--color-raised)",
+        border: `1.5px dashed ${dragging ? "var(--color-accent)" : "var(--color-border-mid)"}`,
+      }}
+    >
+      <input ref={inputRef} type="file" accept={ALLOWED.join(",")} onChange={onInputChange} className="sr-only" />
+
+      <div
+        className="w-11 h-11 rounded-xl flex items-center justify-center"
+        style={{
+          background: dragging ? "var(--color-accent-mid)" : "var(--color-elevated)",
+          border: `1px solid ${dragging ? "rgba(99,102,241,0.3)" : "var(--color-border)"}`,
+        }}
+      >
+        <Upload size={18} style={{ color: dragging ? "var(--color-accent)" : "var(--color-text-2)" }} />
+      </div>
+
+      <div className="text-center">
+        <p className="text-[13px] font-medium" style={{ color: "var(--color-text)" }}>
+          {dragging ? "Drop to upload" : "Drop file or click to browse"}
+        </p>
+        <p className="text-[11px] mt-0.5" style={{ color: "var(--color-text-3)" }}>
+          CSV · XLSX · XLS · PDF — up to {MAX_MB} MB
+        </p>
+      </div>
+
       {error && (
-        <div className="flex items-start gap-2.5 text-sm text-danger bg-danger-soft rounded-xl px-4 py-3 animate-fade-in">
-          <AlertCircle size={16} className="shrink-0 mt-0.5" />
-          <span className="flex-1 leading-snug">{error}</span>
-          <button onClick={() => setError(null)} className="shrink-0 hover:opacity-70 transition-opacity">
-            <X size={14} />
-          </button>
+        <div
+          className="flex items-center gap-1.5 text-[12px] px-3 py-1.5 rounded-md"
+          style={{ color: "var(--color-danger)", background: "var(--color-danger-dim)", border: "1px solid rgba(239,68,68,0.2)" }}
+        >
+          <AlertCircle size={12} />
+          {error}
         </div>
       )}
     </div>

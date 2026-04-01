@@ -1,217 +1,212 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, StopCircle, Search, Sparkles, FileSpreadsheet } from "lucide-react";
-import { queryStream } from "@/lib/api";
+import { Send, Square } from "lucide-react";
+import { queryStream, FileInfo } from "@/lib/api";
 import MessageList, { Message } from "./MessageList";
 
 interface ChatBoxProps {
-  fileId: string | null;
-  fileName: string | null;
+  activeFile: FileInfo;
 }
 
-type Phase = "idle" | "searching" | "generating";
 
-const PHASE_LABELS: Record<Phase, string> = {
-  idle:       "",
-  searching:  "Searching your data…",
-  generating: "Generating answer…",
-};
+let _msgId = 0;
+const nextId = () => `msg-${++_msgId}`;
 
-export default function ChatBox({ fileId, fileName }: ChatBoxProps) {
+export default function ChatBox({ activeFile }: ChatBoxProps) {
   const [messages,    setMessages]    = useState<Message[]>([]);
   const [input,       setInput]       = useState("");
-  const [isStreaming, setIsStreaming]  = useState(false);
-  const [phase,       setPhase]       = useState<Phase>("idle");
+  const [isStreaming, setIsStreaming] = useState(false);
   const scrollRef  = useRef<HTMLDivElement>(null);
-  const inputRef   = useRef<HTMLTextAreaElement>(null);
-  const abortRef   = useRef(false);
-  // Track whether any token arrived yet (to distinguish searching vs generating)
-  const gotTokenRef = useRef(false);
+  const abortRef   = useRef<(() => void) | null>(null);
+  const prevFileId = useRef<string>("");
 
+  // Reset chat when file changes
+  useEffect(() => {
+    if (prevFileId.current !== activeFile.file_id) {
+      prevFileId.current = activeFile.file_id;
+      setMessages([]);
+    }
+  }, [activeFile.file_id]);
+
+  // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, phase]);
+  }, [messages]);
 
-  useEffect(() => {
-    if (inputRef.current) {
-      inputRef.current.style.height = "auto";
-      inputRef.current.style.height = Math.min(inputRef.current.scrollHeight, 120) + "px";
-    }
-  }, [input]);
+  const stopStreaming = useCallback(() => {
+    abortRef.current?.();
+    abortRef.current = null;
+    setIsStreaming(false);
+    setMessages((prev) =>
+      prev.map((m) => m.isStreaming ? { ...m, isStreaming: false } : m)
+    );
+  }, []);
 
   const handleSend = useCallback(async () => {
-    const question = input.trim();
-    if (!question || isStreaming) return;
+    const q = input.trim();
+    if (!q || isStreaming) return;
 
-    const userMsg: Message = { id: Date.now().toString(), role: "user", content: question };
-    const assistantMsg: Message = { id: (Date.now() + 1).toString(), role: "assistant", content: "", isStreaming: true };
-
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setInput("");
     setIsStreaming(true);
-    setPhase("searching");
-    abortRef.current   = false;
-    gotTokenRef.current = false;
 
-    try {
-      const history = messages.map((m) => ({ role: m.role, content: m.content }));
+    const userMsg: Message = { id: nextId(), role: "user", content: q };
+    const assistantId = nextId();
+    const assistantMsg: Message = { id: assistantId, role: "assistant", content: "", isStreaming: true };
 
-      await queryStream(question, fileId, null, history, (token: string) => {
-        if (abortRef.current) return;
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
-        // First token arriving means search is done — switch to generating phase
-        if (!gotTokenRef.current) {
-          gotTokenRef.current = true;
-          setPhase("generating");
-        }
+    let accumulated = "";
+    let aborted = false;
 
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last.role === "assistant") {
-            return [...prev.slice(0, -1), { ...last, content: last.content + token }];
-          }
-          return prev;
-        });
-      });
-    } catch (err: unknown) {
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last.role === "assistant" && !last.content) {
-          const msg = err instanceof Error ? err.message : "Something went wrong";
-          return [...prev.slice(0, -1), { ...last, content: `Error: ${msg}` }];
-        }
-        return prev;
-      });
-    } finally {
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last.role === "assistant") {
-          return [...prev.slice(0, -1), { ...last, isStreaming: false }];
-        }
-        return prev;
-      });
-      setIsStreaming(false);
-      setPhase("idle");
-    }
-  }, [input, isStreaming, fileId, messages]);
+    const { abort } = queryStream(
+      { question: q, file_id: activeFile.file_id, chat_history: [] },
+      {
+        onToken: (token) => {
+          accumulated += token;
+          setMessages((prev) =>
+            prev.map((m) => m.id === assistantId ? { ...m, content: accumulated } : m)
+          );
+        },
+        onSources: () => {},
+        onDone: () => {
+          if (aborted) return;
+          setIsStreaming(false);
+          abortRef.current = null;
+          setMessages((prev) =>
+            prev.map((m) => m.id === assistantId ? { ...m, content: accumulated, isStreaming: false } : m)
+          );
+        },
+        onError: (err) => {
+          if (aborted) return;
+          setIsStreaming(false);
+          abortRef.current = null;
+          const errContent = accumulated
+            ? `${accumulated}\n\n⚠ ${err}`
+            : `Error: ${err}`;
+          setMessages((prev) =>
+            prev.map((m) => m.id === assistantId ? { ...m, content: errContent, isStreaming: false } : m)
+          );
+        },
+      }
+    );
+    abortRef.current = () => { aborted = true; abort(); };
+  }, [input, isStreaming, activeFile.file_id]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
   };
 
-  const handleStop = () => {
-    abortRef.current = true;
-    setIsStreaming(false);
-    setPhase("idle");
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last.role === "assistant") {
-        return [...prev.slice(0, -1), { ...last, isStreaming: false }];
-      }
-      return prev;
-    });
-  };
+  const handleStop = () => stopStreaming();
 
-  const disabled = !fileId;
+  const disabled = false;
+
+  const extColors: Record<string, string> = {
+    csv: "var(--color-csv)", xlsx: "var(--color-excel)",
+    xls: "var(--color-excel)", pdf: "var(--color-pdf)",
+  };
+  const ext = activeFile.file_name.split(".").pop()?.toLowerCase() ?? "";
+  const extColor = extColors[ext] ?? "var(--color-text-2)";
 
   return (
-    <div className="flex flex-col h-full bg-surface-0">
-      {/* Messages */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto">
-        <MessageList messages={messages} />
-
-        {/* Live phase indicator — shown below messages while streaming */}
+    <div className="flex flex-col h-full">
+      {/* Context bar */}
+      <div
+        className="shrink-0 flex items-center justify-between px-5 py-2.5 border-b"
+        style={{ background: "var(--color-surface)", borderColor: "var(--color-border)" }}
+      >
+        <div className="flex items-center gap-2.5 min-w-0">
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded shrink-0 uppercase"
+            style={{
+              color: extColor,
+              background: `${extColor}20`,
+              border: `1px solid ${extColor}40`,
+              letterSpacing: "0.04em",
+            }}
+          >
+            {ext}
+          </span>
+          <div className="min-w-0">
+            <p className="text-[13px] font-medium truncate" style={{ color: "var(--color-text)" }}>
+              {activeFile.file_name}
+            </p>
+            {activeFile.chunks != null && (
+              <p className="text-[11px]" style={{ color: "var(--color-text-3)" }}>
+                {activeFile.chunks.toLocaleString()} chunks indexed
+              </p>
+            )}
+          </div>
+        </div>
         {isStreaming && (
-          <div className="px-4 pb-4 animate-fade-in">
-            <div className="flex items-center gap-2.5 max-w-xl">
-              <div className={[
-                "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-                phase === "searching"  ? "bg-warning-soft text-warning"  : "",
-                phase === "generating" ? "bg-accent-soft text-accent"    : "",
-              ].join(" ")}>
-                {phase === "searching"  && <Search   size={15} />}
-                {phase === "generating" && <Sparkles size={15} />}
-              </div>
-              <div className="flex items-center gap-2 bg-surface-1 border border-border rounded-xl px-3 py-2">
-                <span className="text-xs font-medium text-ink-muted">
-                  {PHASE_LABELS[phase]}
-                </span>
-                <span className="dot-loader text-ink-faint">
-                  <span /><span /><span />
-                </span>
-              </div>
-            </div>
+          <div className="flex items-center gap-1.5 text-[11px] anim-fade-in" style={{ color: "var(--color-accent-text)" }}>
+            <span className="dot-loader"><span /><span /><span /></span>
+            <span>Generating…</span>
           </div>
         )}
       </div>
 
-      {/* Input area */}
-      <div className="border-t border-border bg-surface-1 px-4 py-3 space-y-2">
-        {/* Context pill */}
-        {fileId && fileName && (
-          <div className="flex items-center gap-1.5">
-            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-accent-soft rounded-full">
-              <FileSpreadsheet size={11} className="text-accent" />
-              <span className="text-[11px] font-medium text-accent-text truncate max-w-50">
-                {fileName}
-              </span>
-            </div>
-          </div>
-        )}
+      {/* Messages */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto"
+        style={{ background: "var(--color-bg)" }}
+      >
+        <MessageList messages={messages} />
+      </div>
 
-        {disabled && (
-          <p className="text-xs text-ink-faint text-center pb-1">
-            Upload a file first to start asking questions
-          </p>
-        )}
-
-        <div className="flex items-end gap-2">
+      {/* Input */}
+      <div
+        className="shrink-0 px-4 pb-5 pt-3"
+        style={{ background: "var(--color-bg)", borderTop: "1px solid var(--color-border)" }}
+      >
+        <div
+          className="max-w-[720px] mx-auto flex items-end gap-2.5 rounded-xl p-3"
+          style={{
+            background: "var(--color-raised)",
+            border: "1px solid var(--color-border-mid)",
+            boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
+          }}
+        >
           <textarea
-            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={disabled ? "Upload a file to get started…" : "Ask a question about your data…"}
-            disabled={disabled}
+            placeholder={`Ask anything about ${activeFile.file_name}…`}
             rows={1}
-            className="
-              flex-1 resize-none rounded-xl border border-border bg-surface-0
-              px-4 py-2.5 text-sm text-ink placeholder:text-ink-faint
-              focus:outline-none focus:border-accent/60 focus:ring-2 focus:ring-accent/10
-              transition-all disabled:opacity-40 disabled:cursor-not-allowed
-            "
+            className="flex-1 bg-transparent resize-none outline-none text-[13.5px] leading-relaxed min-h-[22px] max-h-[140px] overflow-y-auto"
+            style={{ color: "var(--color-text)", fontFamily: "var(--font-sans)" }}
+            onInput={(e) => {
+              const el = e.currentTarget;
+              el.style.height = "auto";
+              el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+            }}
+            disabled={isStreaming}
           />
-
           {isStreaming ? (
             <button
               onClick={handleStop}
-              title="Stop generating"
-              className="shrink-0 w-10 h-10 rounded-xl bg-danger-soft text-danger
-                         flex items-center justify-center hover:bg-danger hover:text-white transition-all"
+              title="Stop"
+              className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 hover:brightness-110 transition-all"
+              style={{ background: "var(--color-danger-dim)", border: "1px solid rgba(239,68,68,0.25)" }}
             >
-              <StopCircle size={18} />
+              <Square size={13} style={{ color: "var(--color-danger)" }} />
             </button>
           ) : (
             <button
               onClick={handleSend}
-              disabled={disabled || !input.trim()}
-              title="Send"
-              className={[
-                "shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-150",
-                disabled || !input.trim()
-                  ? "bg-surface-2 text-ink-faint cursor-not-allowed"
-                  : "bg-accent text-white hover:bg-accent-hover active:scale-95 shadow-sm",
-              ].join(" ")}
+              disabled={!input.trim()}
+              title="Send (Enter)"
+              className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-all disabled:opacity-30 disabled:cursor-not-allowed hover:brightness-110 active:scale-95"
+              style={{ background: "var(--color-accent)" }}
             >
-              <Send size={16} />
+              <Send size={13} className="text-white" />
             </button>
           )}
         </div>
-
-        <p className="text-[10px] text-ink-faint text-center">
+        <p className="text-center text-[10px] mt-2" style={{ color: "var(--color-text-3)" }}>
           Enter to send · Shift+Enter for new line
         </p>
       </div>

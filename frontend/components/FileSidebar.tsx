@@ -5,25 +5,27 @@ import { FileInfo, deleteFile as apiDeleteFile } from "@/lib/api";
 
 interface FileSidebarProps {
   files: FileInfo[];
-  activeFileId: string | null;
-  onSelectFile: (fileId: string, fileName: string) => void;
+  activeFile: FileInfo | null;
+  onSelectFile: (f: FileInfo) => void;
   onDeleteFile: (fileId: string) => void;
   onUploadClick: () => void;
 }
 
 export default function FileSidebar({
   files,
-  activeFileId,
+  activeFile,
   onSelectFile,
   onDeleteFile,
   onUploadClick,
 }: FileSidebarProps) {
   const handleDelete = async (e: React.MouseEvent, fileId: string) => {
     e.stopPropagation();
-    const confirmed = window.confirm("Delete this file and all its data?");
-    if (!confirmed) return;
-    const success = await apiDeleteFile(fileId);
-    if (success) onDeleteFile(fileId);
+    try {
+      await apiDeleteFile(fileId);
+      onDeleteFile(fileId);
+    } catch {
+      // ignore
+    }
   };
 
   return (
@@ -50,18 +52,17 @@ export default function FileSidebar({
           </div>
         ) : (
           files.map((file) => {
-            const active = activeFileId === file.file_id;
+            const active = activeFile?.file_id === file.file_id;
             return (
-              /* Using div+role to avoid nested <button> hydration error */
               <div
                 key={file.file_id}
                 role="button"
                 tabIndex={0}
-                onClick={() => onSelectFile(file.file_id, file.file_name)}
+                onClick={() => onSelectFile(file)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    onSelectFile(file.file_id, file.file_name);
+                    onSelectFile(file);
                   }
                 }}
                 className="w-full text-left px-2.5 py-2 rounded-lg flex items-center gap-2.5 cursor-pointer group relative transition-all duration-150 outline-none focus-visible:ring-1"
@@ -98,11 +99,13 @@ export default function FileSidebar({
                   >
                     {file.file_name}
                   </p>
-                  <p className="flex items-center gap-1 text-[10px] mt-0.5"
-                     style={{ color: "var(--color-ink-faint)" }}>
-                    <Hash size={9} />
-                    {file.chunks.toLocaleString()} chunks
-                  </p>
+                  {file.chunks != null && (
+                    <p className="flex items-center gap-1 text-[10px] mt-0.5"
+                       style={{ color: "var(--color-ink-faint)" }}>
+                      <Hash size={9} />
+                      {file.chunks.toLocaleString()} chunks
+                    </p>
+                  )}
                 </div>
 
                 <button

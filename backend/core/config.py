@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     # Change these in .env to swap providers without touching any code.
 
     embedding_provider: Literal["openai", "huggingface", "local"] = "huggingface"
-    llm_provider: Literal["openai", "anthropic", "grok", "gemini", "groq", "local"] = "grok"
+    llm_provider: Literal["openai", "anthropic", "grok", "gemini", "groq", "ollama", "local"] = "grok"
 
     # ── API keys ───────────────────────────────────────────────────────
     # Only fill in the keys for providers you're using.
@@ -116,6 +116,28 @@ class Settings(BaseSettings):
     #   - In production, this would be a cloud-hosted vector DB instead
 
     chroma_persist_dir: Path = Path("./data/chroma")
+    bm25_dir: Path = Path("./data/bm25")
+    db_path: Path = Path("./data/rag.db")
+
+    # ── Reranker ───────────────────────────────────────────────────────
+    enable_reranker: bool = True
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    # ── Vision / multimodal ────────────────────────────────────────────
+    # enable_vision: set True to describe PDF screenshots with a vision LLM.
+    # vision_provider: which provider handles image description.
+    #   "openai"  → gpt-4o-mini (needs OPENAI_API_KEY)
+    #   "ollama"  → any local multimodal model (e.g. qwen3:latest)
+    #   "none"    → skip image description, text + tables only
+
+    enable_vision: bool = False
+    vision_provider: Literal["openai", "ollama", "none"] = "none"
+
+    # ── Ollama (local or cloud) ────────────────────────────────────────
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_llm_model: str = "qwen3:latest"
+    ollama_vision_model: str = "qwen3:latest"
+    ollama_api_key: str = "ollama"
 
     # ── File upload settings ───────────────────────────────────────────
     upload_dir: Path = Path("./data/uploads")

@@ -49,6 +49,7 @@ WHAT YOU'RE LEARNING:
 
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator
+import asyncio
 
 from core.config import settings
 
@@ -456,21 +457,23 @@ class GroqLLM(BaseLLM):
                 yield chunk.choices[0].delta.content
 
 
-class LocalLLM(BaseLLM):
+class OllamaLLM(BaseLLM):
     """
-    Placeholder for locally-hosted LLMs (Ollama, vLLM, llama.cpp).
+    Ollama-hosted models using the official ollama Python SDK.
 
-    Same extension pattern as the embedder:
-    1. Inherit from BaseLLM
-    2. Implement stream_answer
-    3. Add to the factory
+    Uses `ollama.AsyncClient` directly — no OpenAI-compat shim needed.
+    Works with local Ollama and Ollama Cloud (qwen3.5:cloud, etc.).
+
+    Set in .env:
+        LLM_PROVIDER=ollama
+        OLLAMA_LLM_MODEL=qwen3.5:cloud
+        OLLAMA_BASE_URL=http://localhost:11434   (optional)
     """
 
     def __init__(self):
-        raise NotImplementedError(
-            "Local LLM is a placeholder. "
-            "Implement it when you set up Ollama or a local model server."
-        )
+        from ollama import AsyncClient
+        self.client = AsyncClient(host=settings.ollama_base_url)
+        self.model  = settings.ollama_llm_model
 
     async def stream_answer(
         self,
@@ -478,8 +481,47 @@ class LocalLLM(BaseLLM):
         context: str,
         system_prompt: str | None = None,
     ) -> AsyncGenerator[str, None]:
-        raise NotImplementedError
-        yield ""  # pragma: no cover
+        prompt    = system_prompt or DEFAULT_RAG_PROMPT
+        formatted = prompt.format(context=context)
+
+        from ollama import ResponseError
+
+        try:
+            stream = await asyncio.wait_for(
+                self.client.chat(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": formatted},
+                        {"role": "user",   "content": question},
+                    ],
+                    stream=True,
+                    options={"temperature": 0.1},
+                ),
+                timeout=25,
+            )
+
+            # Inactivity timeout so the frontend never hangs forever.
+            aiter = stream.__aiter__()
+            while True:
+                try:
+                    part = await asyncio.wait_for(anext(aiter), timeout=45)
+                except StopAsyncIteration:
+                    break
+                content = part.message.content
+                if content:
+                    yield content
+
+        except ResponseError as e:
+            if getattr(e, "status_code", None) == 401:
+                raise RuntimeError(
+                    "Ollama unauthorized (401). Run `ollama signin` and verify "
+                    "model access, or switch to a local model."
+                ) from e
+            raise RuntimeError(f"Ollama error: {e}") from e
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                "Ollama timed out. Check server/model health or try a smaller query."
+            ) from e
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -490,17 +532,16 @@ class LocalLLM(BaseLLM):
 def get_llm() -> BaseLLM:
     """
     Returns the right LLM based on the LLM_PROVIDER setting.
-
-    Same factory pattern as get_embedder().
     Change LLM_PROVIDER in .env → entire app uses a different LLM.
     """
     providers = {
-        "openai": OpenAILLM,
-        "anthropic": AnthropicLLM,
-        "grok": GrokLLM,
-        "gemini": GeminiLLM,
-        "groq": GroqLLM,
-        "local": LocalLLM,
+        "openai":     OpenAILLM,
+        "anthropic":  AnthropicLLM,
+        "grok":       GrokLLM,
+        "gemini":     GeminiLLM,
+        "groq":       GroqLLM,
+        "ollama":     OllamaLLM,
+        "local":      OllamaLLM,   # "local" now maps to Ollama
     }
 
     provider_class = providers.get(settings.llm_provider)
